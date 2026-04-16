@@ -1,7 +1,10 @@
 [Unit]
 Description=Thoth MCP memory server (100X)
 Documentation=https://github.com/tobyrichmond12-max/100X
-After=network.target ollama-100x.service
+# Start after Ollama so embedding requests succeed on the first store_memory
+# call.  Wants (not Requires) because Thoth degrades gracefully to BM25-only
+# if Ollama is unreachable — a failed Ollama must not block memory retrieval.
+After=ollama-100x.service
 Wants=ollama-100x.service
 
 [Service]
@@ -11,24 +14,72 @@ Group=thoth
 WorkingDirectory=/opt/100x/thoth-mcp
 
 ExecStart=/usr/bin/node /opt/100x/thoth-mcp/dist/index.js
-Restart=always
-RestartSec=3
 
+# ── Restart policy ────────────────────────────────────────────────────────────
+# on-failure: restart after a crash (non-zero exit / signal), but NOT after a
+# clean shutdown (exit 0 from the SIGTERM handler in index.ts).
+# 5 failures within 60 s → service enters failed state to avoid a tight loop.
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Give the SIGTERM handler in index.ts time to flush and close SQLite WAL
+# before systemd escalates to SIGKILL.
+TimeoutStopSec=15
+
+# ── Runtime configuration ─────────────────────────────────────────────────────
 Environment="THOTH_DB_PATH=/var/lib/thoth/memory.db"
 Environment="OLLAMA_BASE_URL=http://localhost:11434"
 Environment="EMBED_MODEL=nomic-embed-text"
 Environment="NODE_ENV=production"
+# Cap V8 old-generation heap to 384 MB so the Node process stays well within
+# the 512 MB RSS budget on the Jetson 8 GB unified-memory device.
+Environment="NODE_OPTIONS=--max-old-space-size=384"
 
-# Logs
+# ── Logging ───────────────────────────────────────────────────────────────────
+# Thoth emits structured JSON to stderr; journald captures it verbatim.
+# View: journalctl -u thoth-mcp -o cat -f
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=thoth-mcp
 
-# Hardening
-NoNewPrivileges=true
+# ── Security hardening ────────────────────────────────────────────────────────
+
+# Filesystem
 ProtectSystem=strict
 ProtectHome=true
+# Private /tmp and /var/tmp; prevents temp-file collisions with other services.
+PrivateTmp=true
 ReadWritePaths=/var/lib/thoth
+
+# Privileges
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+# Drop all Linux capabilities.  A Node.js MCP server reading/writing SQLite
+# and talking to a local HTTP endpoint requires none.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# SQLite DB files created as 640 (owner rw, group r).
+UMask=0027
+
+# Network
+# Thoth's MCP transport is stdio — no listening socket of its own.
+# It makes outbound HTTP requests only to Ollama on 127.0.0.1:11434.
+# AF_UNIX is needed by Node.js internals (libc resolver, npm cache IPC).
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Kernel-level enforcement of localhost-only reachability, independent of
+# application-layer checks.
+IPAddressAllow=127.0.0.1/8 ::1/128
+IPAddressDeny=any
+
+# NOTE: MemoryDenyWriteExecute is intentionally absent.
+# Node.js V8 JIT compilation requires write+execute memory pages; setting
+# this directive to true would cause the process to crash at startup.
 
 [Install]
 WantedBy=multi-user.target

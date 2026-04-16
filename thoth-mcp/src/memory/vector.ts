@@ -1,75 +1,118 @@
 /**
  * Embedding generation (via Ollama) and cosine similarity search.
- * Embeddings are float32, stored as raw binary blobs in SQLite.
- * No external vector DB — cosine similarity computed in JS over fetched rows.
+ *
+ * Embeddings
+ * ----------
+ * Calls Ollama's POST /api/embeddings endpoint (stable across all versions).
+ * Returns float32 values; stored as raw binary BLOBs in SQLite via store.ts.
+ *
+ * Vector search
+ * -------------
+ * Brute-force cosine similarity over all embedded documents.  O(n) in corpus
+ * size; acceptable up to ~50 k docs on the Jetson 8 GB.  Switch to an HNSW
+ * index (hnswlib-node) if recall latency becomes a problem beyond that.
+ *
+ * Hybrid search
+ * -------------
+ * rrfFuse() merges a BM25 ranked list with a vector ranked list using
+ * Reciprocal Rank Fusion (k = 60).  Each list contributes 1/(k + rank + 1).
  */
 
 import type Database from "better-sqlite3";
+import { iterEmbeddings } from "./store.js";
+
+const EMBED_TIMEOUT_MS = 10_000;
+
+// ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface VectorResult {
   docId: string;
-  score: number; // cosine similarity [0, 1]
+  score: number; // cosine similarity in [-1, 1]; nomic-embed-text produces [0, 1]
 }
 
-// ── Embedding generation ──────────────────────────────────────────────────────
+// ── Embedding via Ollama ──────────────────────────────────────────────────────
 
 export async function embed(
   text: string,
   ollamaBaseUrl: string,
   model: string
 ): Promise<{ ok: true; value: Float32Array } | { ok: false; error: string }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), EMBED_TIMEOUT_MS);
+
   let res: Response;
   try {
     res = await fetch(`${ollamaBaseUrl}/api/embeddings`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model, prompt: text }),
+      signal: controller.signal,
     });
   } catch (err) {
-    return { ok: false, error: `Ollama fetch failed: ${String(err)}` };
+    clearTimeout(timer);
+    const msg =
+      err instanceof Error && err.name === "AbortError"
+        ? `Ollama timed out after ${EMBED_TIMEOUT_MS}ms`
+        : `Ollama unreachable: ${String(err)}`;
+    return { ok: false, error: msg };
+  } finally {
+    clearTimeout(timer);
   }
 
   if (!res.ok) {
-    return { ok: false, error: `Ollama HTTP ${res.status}: ${await res.text()}` };
+    const body = await res.text().catch(() => "");
+    return { ok: false, error: `Ollama HTTP ${res.status}: ${body}` };
   }
 
-  const json = (await res.json()) as { embedding?: number[] };
-  if (!Array.isArray(json.embedding)) {
-    return { ok: false, error: "Ollama response missing embedding field" };
+  let json: unknown;
+  try {
+    json = await res.json();
+  } catch {
+    return { ok: false, error: "Ollama returned non-JSON response" };
   }
 
-  return { ok: true, value: new Float32Array(json.embedding) };
+  if (
+    typeof json !== "object" ||
+    json === null ||
+    !Array.isArray((json as Record<string, unknown>)["embedding"])
+  ) {
+    return { ok: false, error: "Ollama response missing 'embedding' array" };
+  }
+
+  const raw = (json as { embedding: unknown[] })["embedding"];
+  if (raw.some((v) => typeof v !== "number")) {
+    return { ok: false, error: "Ollama embedding contains non-numeric values" };
+  }
+
+  return { ok: true, value: new Float32Array(raw as number[]) };
 }
 
 // ── Vector search ─────────────────────────────────────────────────────────────
 
 /**
- * Brute-force cosine similarity over all documents that have embeddings.
- * Acceptable for corpus sizes up to ~50k docs on Jetson; revisit with HNSW if needed.
+ * Fetch all stored embeddings and return the top-k by cosine similarity.
+ * iterEmbeddings() handles the Buffer → Float32Array conversion with correct
+ * byteOffset so pooled Node.js Buffers are handled safely.
  */
 export function vectorSearch(
   db: Database.Database,
-  queryEmbedding: Float32Array,
+  queryVec: Float32Array,
   limit = 10
 ): VectorResult[] {
-  const rows = db
-    .prepare("SELECT id, embedding FROM documents WHERE embedding IS NOT NULL")
-    .all() as { id: string; embedding: Buffer }[];
+  const results: VectorResult[] = [];
 
-  const results: VectorResult[] = rows.map(({ id, embedding }) => {
-    const vec = new Float32Array(embedding.buffer);
-    return { docId: id, score: cosineSimilarity(queryEmbedding, vec) };
-  });
+  for (const { id, vec } of iterEmbeddings(db)) {
+    const score = cosineSimilarity(queryVec, vec);
+    results.push({ docId: id, score });
+  }
 
-  return results
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
+  return results.sort((a, b) => b.score - a.score).slice(0, limit);
 }
 
 // ── Math ──────────────────────────────────────────────────────────────────────
 
 export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
-  if (a.length !== b.length) return 0;
+  if (a.length !== b.length || a.length === 0) return 0;
 
   let dot = 0;
   let normA = 0;
@@ -87,24 +130,32 @@ export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
   return denom === 0 ? 0 : dot / denom;
 }
 
-/** Reciprocal rank fusion of BM25 + vector result sets. k=60 is standard. */
+/**
+ * Reciprocal Rank Fusion of two ranked lists.
+ *
+ *   score(d) = Σ  1 / (k + rank(d, list) + 1)
+ *
+ * k = 60 suppresses the outsized influence of top-1 results (standard value).
+ * Documents appearing in both lists get contributions from each.
+ */
 export function rrfFuse(
   bm25Results: { docId: string; score: number }[],
   vectorResults: VectorResult[],
   k = 60
 ): { docId: string; score: number }[] {
-  const scores = new Map<string, number>();
+  const fused = new Map<string, number>();
 
-  const addRank = (list: { docId: string }[]) => {
-    list.forEach(({ docId }, rank) => {
-      scores.set(docId, (scores.get(docId) ?? 0) + 1 / (k + rank + 1));
-    });
+  const addList = (list: { docId: string }[]) => {
+    for (let rank = 0; rank < list.length; rank++) {
+      const { docId } = list[rank] as { docId: string };
+      fused.set(docId, (fused.get(docId) ?? 0) + 1 / (k + rank + 1));
+    }
   };
 
-  addRank(bm25Results);
-  addRank(vectorResults);
+  addList(bm25Results);
+  addList(vectorResults);
 
-  return Array.from(scores.entries())
+  return Array.from(fused.entries())
     .map(([docId, score]) => ({ docId, score }))
     .sort((a, b) => b.score - a.score);
 }

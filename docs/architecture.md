@@ -6,7 +6,7 @@
 
 1. **Claude Code** — the user-facing agentic CLI; connects to Thoth via MCP stdio transport
 2. **Thoth MCP Server** — persistent memory layer; exposes hybrid search tools to Claude Code
-3. **Ollama** — local model server; serves `nomic-embed-text` for embeddings and `gemma4:e4b` for inference
+3. **Ollama** — local model server; serves `nomic-embed-text` for embeddings and `gemma3:4b` for inference
 
 All three run as systemd services and restart automatically on failure or reboot.
 
@@ -50,7 +50,7 @@ documents (
 bm25_terms (
   doc_id TEXT REFERENCES documents(id) ON DELETE CASCADE,
   term   TEXT,
-  freq   REAL,                   -- normalised term frequency
+  freq   INTEGER,                -- raw term count (not normalised)
   PRIMARY KEY (doc_id, term)
 )
 ```
@@ -62,8 +62,8 @@ WAL mode is enabled on every open — survives abrupt power loss.
 Standard Okapi BM25 with k1=1.5, b=0.75.
 
 - Terms are lower-cased, punctuation-stripped, split on whitespace
-- TF is normalised by document length at index time and stored in `bm25_terms`
-- IDF is computed at query time from corpus stats (no pre-computation needed at this scale)
+- Raw term counts stored in `bm25_terms.freq`; `documents.doc_len` stores total token count
+- IDF computed at query time via a single JOIN per query term (no N+1 per-doc queries)
 - Scoring loop is pure JS — no native addon, no WASM
 
 ## Vector Implementation
@@ -85,7 +85,7 @@ thoth-mcp.service
   User=thoth
   ExecStart=node /opt/100x/thoth-mcp/dist/index.js
   After=ollama-100x.service
-  Restart=always
+  Restart=on-failure
 ```
 
 Thoth runs as a dedicated `thoth` user with write access only to `/var/lib/thoth`.
@@ -97,7 +97,7 @@ Thoth runs as a dedicated `thoth` user with write access only to `/var/lib/thoth
 | Node (Thoth MCP) | ~80–150 MB |
 | Ollama server | ~200 MB idle |
 | nomic-embed-text model | ~300 MB VRAM |
-| gemma4:e4b model | ~4–5 GB VRAM (quantised) |
+| gemma3:4b model | ~4–5 GB VRAM (quantised) |
 
 Jetson Orin Nano has unified CPU/GPU memory (8 GB). Keep Node under 512 MB.
 

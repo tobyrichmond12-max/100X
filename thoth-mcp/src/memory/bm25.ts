@@ -1,13 +1,26 @@
 /**
- * BM25 (Okapi BM25) retrieval over the document corpus.
+ * Okapi BM25 retrieval over the document corpus.
  *
- * Term frequencies are pre-indexed into the `bm25_terms` table.
- * At query time we compute BM25 scores in JS against the stored TF rows.
+ * Indexing
+ * --------
+ * Raw term counts (integers) are stored in `bm25_terms.freq`.
+ * The total token count for the document is written back to `documents.doc_len`
+ * inside the same transaction so scoring never needs a separate docLen query.
  *
- * Parameters: k1=1.5, b=0.75 (standard defaults).
+ * Scoring
+ * -------
+ * At query time a single JOIN per query term fetches (doc_id, freq, doc_len)
+ * together — no N+1 per-document round-trips.
+ *
+ *   IDF  = log(1 + (N - df + 0.5) / (df + 0.5))
+ *   TF'  = freq * (k1 + 1) / (freq + k1 * (1 - b + b * (docLen / avgDl)))
+ *   score += IDF * TF'
+ *
+ * Parameters: k1 = 1.5, b = 0.75 (Robertson & Zaragoza defaults).
  */
 
 import type Database from "better-sqlite3";
+import { updateDocLen } from "./store.js";
 
 const K1 = 1.5;
 const B = 0.75;
@@ -17,64 +30,70 @@ export interface BM25Result {
   score: number;
 }
 
-// ── Indexing ─────────────────────────────────────────────────────────────────
+// ── Indexing ──────────────────────────────────────────────────────────────────
 
+/**
+ * Index a document's content into `bm25_terms` and update `documents.doc_len`.
+ * Must be called after `insertDocument`.
+ */
 export function indexDocument(
   db: Database.Database,
   docId: string,
   content: string
 ): void {
   const terms = tokenise(content);
-  const tf = termFrequencies(terms);
+  if (terms.length === 0) return;
 
+  const counts = rawCounts(terms);
   const insert = db.prepare(
     "INSERT OR REPLACE INTO bm25_terms (doc_id, term, freq) VALUES (?, ?, ?)"
   );
 
-  const insertMany = db.transaction((entries: [string, number][]) => {
-    for (const [term, freq] of entries) {
+  db.transaction(() => {
+    for (const [term, freq] of Object.entries(counts)) {
       insert.run(docId, term, freq);
     }
-  });
-
-  insertMany(Object.entries(tf));
+    updateDocLen(db, docId, terms.length);
+  })();
 }
 
 export function removeIndex(db: Database.Database, docId: string): void {
   db.prepare("DELETE FROM bm25_terms WHERE doc_id = ?").run(docId);
 }
 
-// ── Query ─────────────────────────────────────────────────────────────────────
+// ── Querying ──────────────────────────────────────────────────────────────────
 
 export function bm25Search(
   db: Database.Database,
   query: string,
   limit = 10
 ): BM25Result[] {
-  const queryTerms = tokenise(query);
+  const queryTerms = [...new Set(tokenise(query))]; // dedup
   if (queryTerms.length === 0) return [];
 
-  const { avgDl, corpusSize } = corpusStats(db);
-
+  const { corpusSize, avgDl } = corpusStats(db);
   const scores = new Map<string, number>();
 
-  for (const term of queryTerms) {
-    const rows = db
-      .prepare(
-        "SELECT doc_id, freq FROM bm25_terms WHERE term = ?"
-      )
-      .all(term) as { doc_id: string; freq: number }[];
+  // One JOIN query per unique query term — no N+1 per matching document
+  const termStmt = db.prepare<[string], { doc_id: string; freq: number; doc_len: number }>(`
+    SELECT bt.doc_id, bt.freq, d.doc_len
+    FROM   bm25_terms bt
+    JOIN   documents  d  ON bt.doc_id = d.id
+    WHERE  bt.term = ?
+  `);
 
+  for (const term of queryTerms) {
+    const rows = termStmt.all(term);
     if (rows.length === 0) continue;
 
     const df = rows.length;
     const idf = Math.log(1 + (corpusSize - df + 0.5) / (df + 0.5));
 
-    for (const { doc_id, freq } of rows) {
-      const docLen = docLength(db, doc_id);
-      const tf = freq * (K1 + 1) / (freq + K1 * (1 - B + B * (docLen / avgDl)));
-      const contribution = idf * tf;
-      scores.set(doc_id, (scores.get(doc_id) ?? 0) + contribution);
+    for (const { doc_id, freq, doc_len } of rows) {
+      const dl = doc_len > 0 ? doc_len : 1;
+      const tf =
+        (freq * (K1 + 1)) / (freq + K1 * (1 - B + B * (dl / avgDl)));
+      scores.set(doc_id, (scores.get(doc_id) ?? 0) + idf * tf);
     }
   }
 
@@ -84,8 +103,12 @@ export function bm25Search(
     .slice(0, limit);
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Tokenisation ──────────────────────────────────────────────────────────────
 
+/**
+ * Lowercase, strip non-word chars, split on whitespace, drop 1-char tokens.
+ * Exported so tests and the chunker can reuse it.
+ */
 export function tokenise(text: string): string[] {
   return text
     .toLowerCase()
@@ -94,40 +117,31 @@ export function tokenise(text: string): string[] {
     .filter((t) => t.length > 1);
 }
 
-function termFrequencies(terms: string[]): Record<string, number> {
-  const tf: Record<string, number> = {};
-  for (const t of terms) {
-    tf[t] = (tf[t] ?? 0) + 1;
-  }
-  // Normalise by doc length
-  const len = terms.length || 1;
-  for (const t of Object.keys(tf)) {
-    tf[t] = (tf[t] as number) / len;
-  }
-  return tf;
-}
+// ── Private helpers ───────────────────────────────────────────────────────────
 
-function docLength(db: Database.Database, docId: string): number {
-  const row = db
-    .prepare("SELECT SUM(freq) AS total FROM bm25_terms WHERE doc_id = ?")
-    .get(docId) as { total: number | null };
-  return row.total ?? 1;
+/** Raw (integer) term counts — NOT normalised. */
+function rawCounts(terms: string[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const t of terms) {
+    counts[t] = (counts[t] ?? 0) + 1;
+  }
+  return counts;
 }
 
 function corpusStats(
   db: Database.Database
-): { avgDl: number; corpusSize: number } {
-  const countRow = db
-    .prepare("SELECT COUNT(DISTINCT doc_id) AS n FROM bm25_terms")
-    .get() as { n: number };
-  const corpusSize = countRow.n || 1;
-
-  const avgRow = db
+): { corpusSize: number; avgDl: number } {
+  const row = db
     .prepare(
-      "SELECT AVG(s) AS avg_dl FROM (SELECT SUM(freq) AS s FROM bm25_terms GROUP BY doc_id)"
+      `SELECT COUNT(*)           AS n,
+              COALESCE(AVG(doc_len), 1) AS avg_dl
+       FROM   documents
+       WHERE  doc_len > 0`
     )
-    .get() as { avg_dl: number | null };
-  const avgDl = avgRow.avg_dl ?? 1;
+    .get() as { n: number; avg_dl: number };
 
-  return { avgDl, corpusSize };
+  return {
+    corpusSize: row.n > 0 ? row.n : 1,
+    avgDl: row.avg_dl > 0 ? row.avg_dl : 1,
+  };
 }

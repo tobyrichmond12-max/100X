@@ -1,16 +1,20 @@
 /**
  * Thoth MCP Server — entry point.
- * Registers store_memory, search_memory, list_memories, delete_memory tools.
+ *
+ * Registers four tools for Claude Code:
+ *   store_memory    — chunk, BM25-index, embed, persist
+ *   search_memory   — hybrid BM25+vector (degrades to BM25 if Ollama is down)
+ *   list_memories   — enumerate stored docs, optionally filtered by tag
+ *   delete_memory   — remove a doc by UUID
+ *
  * Transport: stdio (Claude Code default).
+ * Config:    environment variables (defaults suitable for local dev).
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { openStore } from "./memory/store.js";
-import {
-  StoreMemoryInput,
-  storeMemory,
-} from "./tools/remember.js";
+import { StoreMemoryInput, storeMemory } from "./tools/remember.js";
 import {
   SearchMemoryInput,
   ListMemoriesInput,
@@ -20,20 +24,25 @@ import {
   deleteMemory,
 } from "./tools/recall.js";
 
-// ── Config from environment ───────────────────────────────────────────────────
+// ── Logging (defined first — used throughout module scope below) ──────────────
 
-function requireEnv(name: string): string {
-  const val = process.env[name];
-  if (!val) throw new Error(`Missing required env var: ${name}`);
-  return val;
+function log(
+  level: "info" | "warn" | "error",
+  msg: string,
+  ctx: Record<string, unknown> = {}
+): void {
+  process.stderr.write(
+    JSON.stringify({ level, msg, ts: Date.now(), ...ctx }) + "\n"
+  );
 }
 
+// ── Config ────────────────────────────────────────────────────────────────────
+
 const DB_PATH = process.env["THOTH_DB_PATH"] ?? "/var/lib/thoth/memory.db";
-const OLLAMA_BASE_URL =
-  process.env["OLLAMA_BASE_URL"] ?? "http://localhost:11434";
+const OLLAMA_BASE_URL = process.env["OLLAMA_BASE_URL"] ?? "http://localhost:11434";
 const EMBED_MODEL = process.env["EMBED_MODEL"] ?? "nomic-embed-text";
 
-// ── Boot ──────────────────────────────────────────────────────────────────────
+// ── DB ────────────────────────────────────────────────────────────────────────
 
 const db = openStore(DB_PATH);
 
@@ -43,39 +52,31 @@ log("info", "thoth-mcp starting", {
   model: EMBED_MODEL,
 });
 
-const server = new McpServer({
-  name: "thoth",
-  version: "0.1.0",
-});
+// ── MCP server ────────────────────────────────────────────────────────────────
+
+const server = new McpServer({ name: "thoth", version: "0.1.0" });
 
 // ── Tool: store_memory ────────────────────────────────────────────────────────
 
 server.tool(
   "store_memory",
-  "Store a piece of text in persistent memory. Chunks large documents automatically and generates embeddings for semantic search.",
+  "Persist text to long-term memory. Large documents are chunked automatically. " +
+    "Each chunk is BM25-indexed and embedded for hybrid search. " +
+    "Embedding is best-effort — the document is still searchable via BM25 if Ollama is unreachable.",
   StoreMemoryInput.shape,
   async (input) => {
     const parsed = StoreMemoryInput.safeParse(input);
     if (!parsed.success) {
-      return {
-        content: [{ type: "text", text: `Invalid input: ${parsed.error.message}` }],
-        isError: true,
-      };
+      return errorContent(`Invalid input: ${parsed.error.message}`);
     }
 
     const result = await storeMemory(db, parsed.data, OLLAMA_BASE_URL, EMBED_MODEL);
-
     if (!result.ok) {
       log("error", "store_memory failed", { error: result.error });
-      return {
-        content: [{ type: "text", text: `Error: ${result.error}` }],
-        isError: true,
-      };
+      return errorContent(result.error);
     }
 
-    return {
-      content: [{ type: "text", text: result.value.message }],
-    };
+    return { content: [{ type: "text", text: result.value.message }] };
   }
 );
 
@@ -83,30 +84,21 @@ server.tool(
 
 server.tool(
   "search_memory",
-  "Search persistent memory using BM25 keyword search, vector semantic search, or a hybrid of both (default). Returns ranked results.",
+  "Search long-term memory. " +
+    "mode=hybrid (default): BM25 + vector RRF, degrades to BM25-only if Ollama is unreachable. " +
+    "mode=bm25: keyword search only. " +
+    "mode=vector: semantic search only (fails if Ollama is unreachable).",
   SearchMemoryInput.shape,
   async (input) => {
     const parsed = SearchMemoryInput.safeParse(input);
     if (!parsed.success) {
-      return {
-        content: [{ type: "text", text: `Invalid input: ${parsed.error.message}` }],
-        isError: true,
-      };
+      return errorContent(`Invalid input: ${parsed.error.message}`);
     }
 
-    const result = await searchMemory(
-      db,
-      parsed.data,
-      OLLAMA_BASE_URL,
-      EMBED_MODEL
-    );
-
+    const result = await searchMemory(db, parsed.data, OLLAMA_BASE_URL, EMBED_MODEL);
     if (!result.ok) {
       log("error", "search_memory failed", { error: result.error });
-      return {
-        content: [{ type: "text", text: `Error: ${result.error}` }],
-        isError: true,
-      };
+      return errorContent(result.error);
     }
 
     if (result.value.length === 0) {
@@ -116,9 +108,9 @@ server.tool(
     const text = result.value
       .map(
         (r, i) =>
-          `[${i + 1}] id=${r.id} score=${r.score.toFixed(4)}` +
-          (r.source ? ` source=${r.source}` : "") +
-          (r.tags.length ? ` tags=${r.tags.join(",")}` : "") +
+          `[${i + 1}] id=${r.id}  score=${r.score.toFixed(4)}` +
+          (r.source ? `  source=${r.source}` : "") +
+          (r.tags.length ? `  tags=${r.tags.join(",")}` : "") +
           `\n${r.content}`
       )
       .join("\n\n---\n\n");
@@ -131,15 +123,13 @@ server.tool(
 
 server.tool(
   "list_memories",
-  "List all stored memories, optionally filtered by tag. Returns id, source, tags, and a short preview of each.",
+  "List stored memory documents. Optionally filter by tag. " +
+    "Returns id, source, tags, and a 120-character preview for each document.",
   ListMemoriesInput.shape,
   (input) => {
     const parsed = ListMemoriesInput.safeParse(input);
     if (!parsed.success) {
-      return {
-        content: [{ type: "text", text: `Invalid input: ${parsed.error.message}` }],
-        isError: true,
-      };
+      return errorContent(`Invalid input: ${parsed.error.message}`);
     }
 
     const result = listMemories(db, parsed.data);
@@ -151,8 +141,8 @@ server.tool(
       .map(
         (m) =>
           `id=${m.id}` +
-          (m.source ? ` source=${m.source}` : "") +
-          (m.tags.length ? ` tags=${m.tags.join(",")}` : "") +
+          (m.source ? `  source=${m.source}` : "") +
+          (m.tags.length ? `  tags=${m.tags.join(",")}` : "") +
           `\n  ${m.preview}`
       )
       .join("\n");
@@ -165,49 +155,45 @@ server.tool(
 
 server.tool(
   "delete_memory",
-  "Delete a memory document by its ID.",
+  "Permanently delete a memory document by its UUID.",
   DeleteMemoryInput.shape,
   (input) => {
     const parsed = DeleteMemoryInput.safeParse(input);
     if (!parsed.success) {
-      return {
-        content: [{ type: "text", text: `Invalid input: ${parsed.error.message}` }],
-        isError: true,
-      };
+      return errorContent(`Invalid input: ${parsed.error.message}`);
     }
 
     const result = deleteMemory(db, parsed.data);
     if (!result.ok) {
-      return {
-        content: [{ type: "text", text: `Error: ${result.error}` }],
-        isError: true,
-      };
+      return errorContent(result.error);
     }
 
     return { content: [{ type: "text", text: `Deleted ${parsed.data.id}` }] };
   }
 );
 
-// ── Start ─────────────────────────────────────────────────────────────────────
+// ── Graceful shutdown ─────────────────────────────────────────────────────────
 
-process.on("SIGTERM", () => {
-  log("info", "SIGTERM received, shutting down");
+function shutdown(signal: string): void {
+  log("info", "shutting down", { signal });
   db.close();
   process.exit(0);
-});
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+// ── Start ─────────────────────────────────────────────────────────────────────
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
 log("info", "thoth-mcp ready");
 
-// ── Logging ───────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-function log(
-  level: "info" | "warn" | "error",
-  msg: string,
-  ctx: Record<string, unknown> = {}
-): void {
-  process.stderr.write(
-    JSON.stringify({ level, msg, ts: Date.now(), ...ctx }) + "\n"
-  );
+function errorContent(msg: string) {
+  return {
+    content: [{ type: "text" as const, text: `Error: ${msg}` }],
+    isError: true,
+  };
 }

@@ -1,6 +1,9 @@
 [Unit]
 Description=Ollama LLM server (100X)
 Documentation=https://ollama.com
+# Wait for a routable network before starting so the API port is bound on the
+# correct interface.  thoth-mcp.service declares After=ollama-100x.service so
+# it inherits this ordering transitively.
 After=network-online.target
 Wants=network-online.target
 
@@ -8,24 +11,76 @@ Wants=network-online.target
 Type=simple
 User=ollama
 Group=ollama
-ExecStart=/usr/local/bin/ollama serve
-Restart=always
-RestartSec=5
 
-# Keep RAM pressure manageable on 8 GB Jetson
+ExecStart=/usr/local/bin/ollama serve
+
+# ── Restart policy ────────────────────────────────────────────────────────────
+# On a dedicated wearable device Ollama must always be running.
+# StartLimitIntervalSec=0 disables the restart-rate cap so a crashloop does
+# not leave the device without LLM access.  The RestartSec back-off gives the
+# kernel and GPU driver a moment to recover between attempts.
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=0
+
+# Allow up to 60 s for Ollama to finish unloading the active model on SIGTERM
+# before systemd sends SIGKILL.
+TimeoutStopSec=60
+
+# ── Runtime configuration ─────────────────────────────────────────────────────
+
+# Bind the HTTP API to the loopback interface only.  This is the primary
+# localhost-only enforcement; IPAddressAllow/Deny below adds a kernel-level
+# second layer.
+Environment="OLLAMA_HOST=127.0.0.1:11434"
+
+# Jetson Orin Nano has 8 GB of unified CPU/GPU memory.  Keep to one loaded
+# model and one parallel inference stream to avoid OOM on the edge device.
 Environment="OLLAMA_MAX_LOADED_MODELS=1"
 Environment="OLLAMA_NUM_PARALLEL=1"
 
-# Logs
+# Explicit model store path so the unit is self-documenting and the path is
+# consistent with the ReadWritePaths declaration below.
+Environment="OLLAMA_MODELS=/var/lib/ollama/models"
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=ollama-100x
 
-# Hardening
-NoNewPrivileges=true
+# ── Security hardening ────────────────────────────────────────────────────────
+
+# Filesystem
+# strict: entire filesystem read-only except paths listed in ReadWritePaths.
 ProtectSystem=strict
 ProtectHome=true
+# Private, service-local /tmp and /var/tmp; survives service restarts cleanly.
+PrivateTmp=true
 ReadWritePaths=/var/lib/ollama
+
+# Privileges
+# No child process may gain new privileges via setuid / file capabilities.
+NoNewPrivileges=true
+# Prevent writes to kernel variables (/proc/sys, /sys).
+ProtectKernelTunables=true
+# Block loading of kernel modules (not needed by a userspace inference server).
+ProtectKernelModules=true
+# Read-only view of cgroup filesystem; Ollama has no legitimate reason to
+# modify control group settings.
+ProtectControlGroups=true
+# Prevent personality(2) calls that could change the execution domain.
+LockPersonality=true
+# Refuse to create setuid/setgid files (defence against privilege escalation).
+RestrictSUIDSGID=true
+# Restrict file-creation permissions: model files are 640 (owner rw, group r).
+UMask=0027
+
+# Network
+# Enforce localhost-only at the kernel packet-filter layer, independent of the
+# OLLAMA_HOST application-level binding.  Ollama at runtime makes no outbound
+# connections (models are pre-pulled during setup.sh).
+IPAddressAllow=127.0.0.1/8 ::1/128
+IPAddressDeny=any
 
 [Install]
 WantedBy=multi-user.target

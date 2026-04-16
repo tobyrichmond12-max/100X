@@ -1,0 +1,28 @@
+{
+  "name": "thoth-mcp",
+  "version": "0.1.0",
+  "description": "BM25 + vector memory MCP server for Claude Code on Jetson Orin Nano",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.10.2",
+    "better-sqlite3": "^11.9.1",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.15.3",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

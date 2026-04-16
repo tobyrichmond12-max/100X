@@ -1,0 +1,34 @@
+[Unit]
+Description=Thoth MCP memory server (100X)
+Documentation=https://github.com/tobyrichmond12-max/100X
+After=network.target ollama-100x.service
+Wants=ollama-100x.service
+
+[Service]
+Type=simple
+User=thoth
+Group=thoth
+WorkingDirectory=/opt/100x/thoth-mcp
+
+ExecStart=/usr/bin/node /opt/100x/thoth-mcp/dist/index.js
+Restart=always
+RestartSec=3
+
+Environment="THOTH_DB_PATH=/var/lib/thoth/memory.db"
+Environment="OLLAMA_BASE_URL=http://localhost:11434"
+Environment="EMBED_MODEL=nomic-embed-text"
+Environment="NODE_ENV=production"
+
+# Logs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=thoth-mcp
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/thoth
+
+[Install]
+WantedBy=multi-user.target

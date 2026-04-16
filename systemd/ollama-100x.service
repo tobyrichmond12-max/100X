@@ -1,0 +1,31 @@
+[Unit]
+Description=Ollama LLM server (100X)
+Documentation=https://ollama.com
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ollama
+Group=ollama
+ExecStart=/usr/local/bin/ollama serve
+Restart=always
+RestartSec=5
+
+# Keep RAM pressure manageable on 8 GB Jetson
+Environment="OLLAMA_MAX_LOADED_MODELS=1"
+Environment="OLLAMA_NUM_PARALLEL=1"
+
+# Logs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ollama-100x
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ollama
+
+[Install]
+WantedBy=multi-user.target

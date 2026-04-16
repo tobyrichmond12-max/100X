@@ -3,7 +3,10 @@
  *
  * Embeddings
  * ----------
- * Calls Ollama's POST /api/embeddings endpoint (stable across all versions).
+ * Calls Ollama's POST /api/embed endpoint (introduced in Ollama 0.1.26;
+ * the older /api/embeddings endpoint returns 404 on current builds).
+ * Request:  { model, input: text }
+ * Response: { embeddings: [[...float64...]] }  — take embeddings[0].
  * Returns float32 values; stored as raw binary BLOBs in SQLite via store.ts.
  *
  * Vector search
@@ -42,10 +45,10 @@ export async function embed(
 
   let res: Response;
   try {
-    res = await fetch(`${ollamaBaseUrl}/api/embeddings`, {
+    res = await fetch(`${ollamaBaseUrl}/api/embed`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model, prompt: text }),
+      body: JSON.stringify({ model, input: text }),
       signal: controller.signal,
     });
   } catch (err) {
@@ -71,15 +74,19 @@ export async function embed(
     return { ok: false, error: "Ollama returned non-JSON response" };
   }
 
+  // /api/embed returns { embeddings: [[...], ...] } — one inner array per input.
+  // We always send a single string so we expect exactly one inner array.
+  const obj = json as Record<string, unknown>;
   if (
-    typeof json !== "object" ||
-    json === null ||
-    !Array.isArray((json as Record<string, unknown>)["embedding"])
+    typeof obj !== "object" ||
+    obj === null ||
+    !Array.isArray(obj["embeddings"]) ||
+    !Array.isArray((obj["embeddings"] as unknown[])[0])
   ) {
-    return { ok: false, error: "Ollama response missing 'embedding' array" };
+    return { ok: false, error: "Ollama response missing 'embeddings[0]' array" };
   }
 
-  const raw = (json as { embedding: unknown[] })["embedding"];
+  const raw = (obj["embeddings"] as unknown[][])[0] as unknown[];
   if (raw.some((v) => typeof v !== "number")) {
     return { ok: false, error: "Ollama embedding contains non-numeric values" };
   }

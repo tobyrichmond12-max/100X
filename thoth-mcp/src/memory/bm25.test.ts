@@ -92,7 +92,7 @@ describe("bm25Search", () => {
     const resultsTwice = bm25Search(db, "apple apple");
     // Scores should be identical because we deduplicate query terms
     expect(resultsTwice[0]?.score).toBeCloseTo(resultsOnce[0]?.score ?? 0, 5);
-    expect(results => results).toBeDefined();
+    expect(results).toBeDefined();
     void id;
   });
 
